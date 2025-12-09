@@ -1,26 +1,37 @@
 from flask import Blueprint, request, jsonify, g
 from database import get_db
-from auth import token_required, generate_token
+from auth import token_required, generate_token, hash_password, check_password
 import datetime
 from config import TOKEN_EXPIRY_DAYS
+from wtforms import Form, StringField, PasswordField, validators  
 
 users_bp = Blueprint('users', __name__, url_prefix='/api/v1')
+
+class UserForm(Form):
+    name = StringField('name', [validators.Length(min=1, max=100), validators.DataRequired()])
+    email = StringField('email', [validators.Email(), validators.DataRequired()])
+    password = PasswordField('password', [validators.Length(min=6), validators.DataRequired()])
 
 @users_bp.route("/users", methods=["POST"])
 def create_user():
     data = request.get_json(force=True) or {}
-    name = data.get("name")
-    email = data.get("email")
-    password = data.get("password")
+    form = UserForm(data=data) 
+    if not form.validate():
+        return jsonify({"error": "Datos inválidos", "details": form.errors}), 400
+    
+    name = form.name.data
+    email = form.email.data
+    password = form.password.data
     role = data.get("role", "user")
     if role not in ("user", "admin"):
         role = "user"
-    if not all([name, email, password]):
-        return jsonify({"error": "name, email y password obligatorios"}), 400
+    
+    hashed_password = hash_password(password)
+    
     db = get_db()
     try:
         cur = db.execute("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
-                         (name, email, password, role))
+                         (name, email, hashed_password, role))  
         db.commit()
         return jsonify({"id": cur.lastrowid, "name": name, "email": email, "role": role}), 201
     except sqlite3.IntegrityError:
@@ -34,10 +45,12 @@ def login():
     if not all([email, password]):
         return jsonify({"error": "email y password requeridos"}), 400
     db = get_db()
-    cur = db.execute("SELECT id, name, email, role FROM users WHERE email = ? AND password = ?", (email, password))
+    
+    cur = db.execute("SELECT id, name, email, role, password FROM users WHERE email = ?", (email,))
     row = cur.fetchone()
-    if not row:
+    if not row or not check_password(password, row["password"]): 
         return jsonify({"success": False, "message": "Credenciales incorrectas"}), 401
+    
     token = generate_token()
     expires_at = (datetime.datetime.utcnow() + datetime.timedelta(days=TOKEN_EXPIRY_DAYS)).isoformat()
     db.execute("INSERT INTO tokens (token, user_id, expires_at) VALUES (?, ?, ?)", (token, row["id"], expires_at))
